@@ -1,15 +1,16 @@
-This is Redis 2.3.x.
+Hello! This file is just a placeholder, since this is the "unstable" branch
+of Redis, the place where all the development happens.
 
-It was forked from 2.2 branch a few weeks ago, and is going to be the playground
-for many new developments, especially related to replacing the VM with something
-better.
+There is no release notes for this branch, it gets forked into another branch
+every time there is a partial feature freeze in order to eventually create
+a new stable release.
 
-VM is already completely removed from this release, and instead diskstore was
-implemented. You can read more about it here:
+Usually "unstable" is stable enough for you to use it in development environments
+however you should never use it in production environments. It is possible
+to download the latest stable release here:
 
-http://groups.google.com/group/redis-db/browse_thread/thread/d444bc786689bde9
+    http://download.redis.io/releases/redis-stable.tar.gz
 
-This Redis version is not intented for production environments.
+More information is available at http://redis.io
 
-Cheers,
-Salvatore
+Happy hacking!

@@ -3,9 +3,13 @@ set ::num_passed 0
 set ::num_failed 0
 set ::tests_failed {}
 
+proc fail {msg} {
+    error "assertion:$msg"
+}
+
 proc assert {condition} {
-    if {![uplevel 1 expr $condition]} {
-        error "assertion:Expected '$value' to be true"
+    if {![uplevel 1 [list expr $condition]]} {
+        error "assertion:Expected condition '$condition' to be true ([uplevel 1 [list subst -nocommands $condition]])"
     }
 }
 
@@ -15,9 +19,12 @@ proc assert_match {pattern value} {
     }
 }
 
-proc assert_equal {expected value} {
+proc assert_equal {expected value {detail ""}} {
     if {$expected ne $value} {
-        error "assertion:Expected '$value' to be equal to '$expected'"
+        if {$detail ne ""} {
+            set detail " (detail: $detail)"
+        }
+        error "assertion:Expected '$value' to be equal to '$expected'$detail"
     }
 }
 
@@ -25,7 +32,7 @@ proc assert_error {pattern code} {
     if {[catch {uplevel 1 $code} error]} {
         assert_match $pattern $error
     } else {
-        error "assertion:Expected an error but nothing was catched"
+        error "assertion:Expected an error but nothing was caught"
     }
 }
 
@@ -44,62 +51,22 @@ proc assert_type {type key} {
     assert_equal $type [r type $key]
 }
 
-# Test if TERM looks like to support colors
-proc color_term {} {
-    expr {[info exists ::env(TERM)] && [string match *xterm* $::env(TERM)]}
-}
-
-# This is called before starting the test
-proc announce_test {s} {
-    if {[color_term]} {
-        puts -nonewline "$s\033\[0K"
-        flush stdout
-        set ::backward_count [string length $s]
+# Wait for the specified condition to be true, with the specified number of
+# max retries and delay between retries. Otherwise the 'elsescript' is
+# executed.
+proc wait_for_condition {maxtries delay e _else_ elsescript} {
+    while {[incr maxtries -1] >= 0} {
+        set errcode [catch {uplevel 1 [list expr $e]} result]
+        if {$errcode == 0} {
+            if {$result} break
+        } else {
+            return -code $errcode $result
+        }
+        after $delay
     }
-}
-
-# This is called after the test finished
-proc colored_dot {tags passed} {
-    if {[color_term]} {
-        # Go backward and delete what announc_test function printed.
-        puts -nonewline "\033\[${::backward_count}D\033\[0K\033\[J"
-
-        # Print a coloured char, accordingly to test outcome and tags.
-        if {[lsearch $tags list] != -1} {
-            set colorcode {31}
-            set ch L
-        } elseif {[lsearch $tags hash] != -1} {
-            set colorcode {32}
-            set ch H
-        } elseif {[lsearch $tags set] != -1} {
-            set colorcode {33}
-            set ch S
-        } elseif {[lsearch $tags zset] != -1} {
-            set colorcode {34}
-            set ch Z
-        } elseif {[lsearch $tags basic] != -1} {
-            set colorcode {35}
-            set ch B
-        } else {
-            set colorcode {37}
-            set ch .
-        }
-        if {$colorcode ne {}} {
-            if {$passed} {
-                puts -nonewline "\033\[0;${colorcode};40m"
-            } else {
-                puts -nonewline "\033\[7;${colorcode};40m"
-            }
-            puts -nonewline $ch
-            puts -nonewline "\033\[0m"
-            flush stdout
-        }
-    } else {
-        if {$passed} {
-            puts -nonewline .
-        } else {
-            puts -nonewline F
-        }
+    if {$maxtries == -1} {
+        set errcode [catch [uplevel 1 $elsescript] result]
+        return -code $errcode $result
     }
 }
 
@@ -127,16 +94,9 @@ proc test {name code {okpattern undefined}} {
 
     incr ::num_tests
     set details {}
-    lappend details $::curfile
-    lappend details $::tags
-    lappend details $name
+    lappend details "$name in $::curfile"
 
-    if {$::verbose} {
-        puts -nonewline [format "#%03d %-68s " $::num_tests $name]
-        flush stdout
-    } else {
-        announce_test $name
-    }
+    send_data_packet $::test_server_fd testing $name
 
     if {[catch {set retval [uplevel 1 $code]} error]} {
         if {[string match "assertion:*" $error]} {
@@ -145,12 +105,7 @@ proc test {name code {okpattern undefined}} {
             lappend ::tests_failed $details
 
             incr ::num_failed
-            if {$::verbose} {
-                puts "FAILED"
-                puts "$msg\n"
-            } else {
-                colored_dot $::tags 0
-            }
+            send_data_packet $::test_server_fd err [join $details "\n"]
         } else {
             # Re-raise, let handler up the stack take care of this.
             error $error $::errorInfo
@@ -158,33 +113,21 @@ proc test {name code {okpattern undefined}} {
     } else {
         if {$okpattern eq "undefined" || $okpattern eq $retval || [string match $okpattern $retval]} {
             incr ::num_passed
-            if {$::verbose} {
-                puts "PASSED"
-            } else {
-                colored_dot $::tags 1
-            }
+            send_data_packet $::test_server_fd ok $name
         } else {
             set msg "Expected '$okpattern' to equal or match '$retval'"
             lappend details $msg
             lappend ::tests_failed $details
 
             incr ::num_failed
-            if {$::verbose} {
-                puts "FAILED"
-                puts "$msg\n"
-            } else {
-                colored_dot $::tags 0
-            }
+            send_data_packet $::test_server_fd err [join $details "\n"]
         }
     }
-    flush stdout
 
     if {$::traceleaks} {
         set output [exec leaks redis-server]
         if {![string match {*0 leaks*} $output]} {
-            puts "--- Test \"$name\" leaked! ---"
-            puts $output
-            exit 1
+            send_data_packet $::test_server_fd err "Detected a memory leak in test '$name': $output"
         }
     }
 }

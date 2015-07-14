@@ -1,6 +1,8 @@
 /* Extracted from anet.c to work properly with Hiredis error reporting.
  *
- * Copyright (c) 2006-2010, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2006-2011, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2010-2011, Pieter Noordhuis <pcnoordhuis at gmail dot com>
+ *
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -33,11 +35,17 @@
 
 #include "hiredis.h"
 
-#if defined(__sun)
+#if defined(__sun) || defined(_AIX)
 #define AF_LOCAL AF_UNIX
 #endif
 
-int redisContextConnectTcp(redisContext *c, const char *addr, int port);
-int redisContextConnectUnix(redisContext *c, const char *path);
+int redisCheckSocketError(redisContext *c);
+int redisContextSetTimeout(redisContext *c, const struct timeval tv);
+int redisContextConnectTcp(redisContext *c, const char *addr, int port, const struct timeval *timeout);
+int redisContextConnectBindTcp(redisContext *c, const char *addr, int port,
+                               const struct timeval *timeout,
+                               const char *source_addr);
+int redisContextConnectUnix(redisContext *c, const char *path, const struct timeval *timeout);
+int redisKeepAlive(redisContext *c, int interval);
 
 #endif

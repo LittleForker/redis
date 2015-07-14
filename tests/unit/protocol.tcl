@@ -59,4 +59,59 @@ start_server {tags {"protocol"}} {
         reconnect
         assert_error "*wrong*arguments*ping*" {r ping x y z}
     }
+
+    test "Unbalanced number of quotes" {
+        reconnect
+        r write "set \"\"\"test-key\"\"\" test-value\r\n"
+        r write "ping\r\n"
+        r flush
+        assert_error "*unbalanced*" {r read}
+    }
+
+    set c 0
+    foreach seq [list "\x00" "*\x00" "$\x00"] {
+        incr c
+        test "Protocol desync regression test #$c" {
+            set s [socket [srv 0 host] [srv 0 port]]
+            puts -nonewline $s $seq
+            set payload [string repeat A 1024]"\n"
+            set test_start [clock seconds]
+            set test_time_limit 30
+            while 1 {
+                if {[catch {
+                    puts -nonewline $s payload
+                    flush $s
+                    incr payload_size [string length $payload]
+                }]} {
+                    set retval [gets $s]
+                    close $s
+                    break
+                } else {
+                    set elapsed [expr {[clock seconds]-$test_start}]
+                    if {$elapsed > $test_time_limit} {
+                        close $s
+                        error "assertion:Redis did not closed connection after protocol desync"
+                    }
+                }
+            }
+            set retval
+        } {*Protocol error*}
+    }
+    unset c
+}
+
+start_server {tags {"regression"}} {
+    test "Regression for a crash with blocking ops and pipelining" {
+        set rd [redis_deferring_client]
+        set fd [r channel]
+        set proto "*3\r\n\$5\r\nBLPOP\r\n\$6\r\nnolist\r\n\$1\r\n0\r\n"
+        puts -nonewline $fd $proto$proto
+        flush $fd
+        set res {}
+
+        $rd rpush nolist a
+        $rd read
+        $rd rpush nolist a
+        $rd read
+    }
 }

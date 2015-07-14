@@ -1,3 +1,33 @@
+/*
+ * Copyright (c) 2009-2012, Pieter Noordhuis <pcnoordhuis at gmail dot com>
+ * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
 #include "fmacros.h"
 #include <stdlib.h>
 #include <stdio.h>
@@ -9,11 +39,11 @@
 #define ERROR(...) { \
     char __buf[1024]; \
     sprintf(__buf, __VA_ARGS__); \
-    sprintf(error, "0x%08lx: %s", epos, __buf); \
+    sprintf(error, "0x%16llx: %s", (long long)epos, __buf); \
 }
 
 static char error[1024];
-static long epos;
+static off_t epos;
 
 int consumeNewline(char *buf) {
     if (strncmp(buf,"\r\n",2) != 0) {
@@ -25,7 +55,7 @@ int consumeNewline(char *buf) {
 
 int readLong(FILE *fp, char prefix, long *target) {
     char buf[128], *eptr;
-    epos = ftell(fp);
+    epos = ftello(fp);
     if (fgets(buf,sizeof(buf),fp) == NULL) {
         return 0;
     }
@@ -39,7 +69,7 @@ int readLong(FILE *fp, char prefix, long *target) {
 
 int readBytes(FILE *fp, char *target, long length) {
     long real;
-    epos = ftell(fp);
+    epos = ftello(fp);
     real = fread(target,1,length,fp);
     if (real != length) {
         ERROR("Expected to read %ld bytes, got %ld bytes",length,real);
@@ -72,13 +102,14 @@ int readArgc(FILE *fp, long *target) {
     return readLong(fp,'*',target);
 }
 
-long process(FILE *fp) {
-    long argc, pos = 0;
+off_t process(FILE *fp) {
+    long argc;
+    off_t pos = 0;
     int i, multi = 0;
     char *str;
 
     while(1) {
-        if (!multi) pos = ftell(fp);
+        if (!multi) pos = ftello(fp);
         if (!readArgc(fp, &argc)) break;
 
         for (i = 0; i < argc; i++) {
@@ -148,18 +179,20 @@ int main(int argc, char **argv) {
         exit(1);
     }
 
-    long size = sb.st_size;
+    off_t size = sb.st_size;
     if (size == 0) {
         printf("Empty file: %s\n", filename);
         exit(1);
     }
 
-    long pos = process(fp);
-    long diff = size-pos;
+    off_t pos = process(fp);
+    off_t diff = size-pos;
+    printf("AOF analyzed: size=%lld, ok_up_to=%lld, diff=%lld\n",
+        (long long) size, (long long) pos, (long long) diff);
     if (diff > 0) {
         if (fix) {
             char buf[2];
-            printf("This will shrink the AOF from %ld bytes, with %ld bytes, to %ld bytes\n",size,diff,pos);
+            printf("This will shrink the AOF from %lld bytes, with %lld bytes, to %lld bytes\n",(long long)size,(long long)diff,(long long)pos);
             printf("Continue? [y/N]: ");
             if (fgets(buf,sizeof(buf),stdin) == NULL ||
                 strncasecmp(buf,"y",1) != 0) {

@@ -57,7 +57,7 @@ list *listCreate(void)
  * This function can't fail. */
 void listRelease(list *list)
 {
-    unsigned int len;
+    unsigned long len;
     listNode *current, *next;
 
     current = list->head;
@@ -71,7 +71,7 @@ void listRelease(list *list)
     zfree(list);
 }
 
-/* Add a new node to the list, to head, contaning the specified 'value'
+/* Add a new node to the list, to head, containing the specified 'value'
  * pointer as value.
  *
  * On error, NULL is returned and no operation is performed (i.e. the
@@ -97,7 +97,7 @@ list *listAddNodeHead(list *list, void *value)
     return list;
 }
 
-/* Add a new node to the list, to tail, contaning the specified 'value'
+/* Add a new node to the list, to tail, containing the specified 'value'
  * pointer as value.
  *
  * On error, NULL is returned and no operation is performed (i.e. the
@@ -178,7 +178,7 @@ void listDelNode(list *list, listNode *node)
 listIter *listGetIterator(list *list, int direction)
 {
     listIter *iter;
-    
+
     if ((iter = zmalloc(sizeof(*iter))) == NULL) return NULL;
     if (direction == AL_START_HEAD)
         iter->next = list->head;
@@ -308,9 +308,9 @@ listNode *listSearchKey(list *list, void *key)
 /* Return the element at the specified zero-based index
  * where 0 is the head, 1 is the element next to head
  * and so on. Negative integers are used in order to count
- * from the tail, -1 is the last element, -2 the penultimante
+ * from the tail, -1 is the last element, -2 the penultimate
  * and so on. If the index is out of range NULL is returned. */
-listNode *listIndex(list *list, int index) {
+listNode *listIndex(list *list, long index) {
     listNode *n;
 
     if (index < 0) {
@@ -322,4 +322,20 @@ listNode *listIndex(list *list, int index) {
         while(index-- && n) n = n->next;
     }
     return n;
+}
+
+/* Rotate the list removing the tail node and inserting it to the head. */
+void listRotate(list *list) {
+    listNode *tail = list->tail;
+
+    if (listLength(list) <= 1) return;
+
+    /* Detach current tail */
+    list->tail = tail->prev;
+    list->tail->next = NULL;
+    /* Move it as head */
+    list->head->prev = tail;
+    tail->prev = NULL;
+    tail->next = list->head;
+    list->head = tail;
 }

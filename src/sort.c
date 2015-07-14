@@ -1,5 +1,39 @@
+/* SORT command and helper functions.
+ *
+ * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
+
 #include "redis.h"
 #include "pqsort.h" /* Partial qsort for SORT+LIMIT */
+#include <math.h> /* isnan() */
+
+zskiplistNode* zslGetElementByRank(zskiplist *zsl, unsigned long rank);
 
 redisSortOperation *createSortOperation(int type, robj *pattern) {
     redisSortOperation *so = zmalloc(sizeof(*so));
@@ -8,21 +42,27 @@ redisSortOperation *createSortOperation(int type, robj *pattern) {
     return so;
 }
 
-/* Return the value associated to the key with a name obtained
- * substituting the first occurence of '*' in 'pattern' with 'subst'.
+/* Return the value associated to the key with a name obtained using
+ * the following rules:
+ *
+ * 1) The first occurrence of '*' in 'pattern' is substituted with 'subst'.
+ *
+ * 2) If 'pattern' matches the "->" string, everything on the left of
+ *    the arrow is treated as the name of a hash field, and the part on the
+ *    left as the key name containing a hash. The value of the specified
+ *    field is returned.
+ *
+ * 3) If 'pattern' equals "#", the function simply returns 'subst' itself so
+ *    that the SORT command can be used like: SORT key GET # to retrieve
+ *    the Set/List elements directly.
+ *
  * The returned object will always have its refcount increased by 1
  * when it is non-NULL. */
 robj *lookupKeyByPattern(redisDb *db, robj *pattern, robj *subst) {
-    char *p, *f;
+    char *p, *f, *k;
     sds spat, ssub;
-    robj keyobj, fieldobj, *o;
+    robj *keyobj, *fieldobj = NULL, *o;
     int prefixlen, sublen, postfixlen, fieldlen;
-    /* Expoit the internal sds representation to create a sds string allocated on the stack in order to make this function faster */
-    struct {
-        int len;
-        int free;
-        char buf[REDIS_SORTKEY_MAX+1];
-    } keyname, fieldname;
 
     /* If the pattern is "#" return the substitution object itself in order
      * to implement the "SORT ... GET #" feature. */
@@ -36,9 +76,10 @@ robj *lookupKeyByPattern(redisDb *db, robj *pattern, robj *subst) {
      * a decoded object on the fly. Otherwise getDecodedObject will just
      * increment the ref count, that we'll decrement later. */
     subst = getDecodedObject(subst);
-
     ssub = subst->ptr;
-    if (sdslen(spat)+sdslen(ssub)-1 > REDIS_SORTKEY_MAX) return NULL;
+
+    /* If we can't find '*' in the pattern we return NULL as to GET a
+     * fixed key does not make sense. */
     p = strchr(spat,'*');
     if (!p) {
         decrRefCount(subst);
@@ -46,46 +87,49 @@ robj *lookupKeyByPattern(redisDb *db, robj *pattern, robj *subst) {
     }
 
     /* Find out if we're dealing with a hash dereference. */
-    if ((f = strstr(p+1, "->")) != NULL) {
-        fieldlen = sdslen(spat)-(f-spat);
-        /* this also copies \0 character */
-        memcpy(fieldname.buf,f+2,fieldlen-1);
-        fieldname.len = fieldlen-2;
+    if ((f = strstr(p+1, "->")) != NULL && *(f+2) != '\0') {
+        fieldlen = sdslen(spat)-(f-spat)-2;
+        fieldobj = createStringObject(f+2,fieldlen);
     } else {
         fieldlen = 0;
     }
 
+    /* Perform the '*' substitution. */
     prefixlen = p-spat;
     sublen = sdslen(ssub);
-    postfixlen = sdslen(spat)-(prefixlen+1)-fieldlen;
-    memcpy(keyname.buf,spat,prefixlen);
-    memcpy(keyname.buf+prefixlen,ssub,sublen);
-    memcpy(keyname.buf+prefixlen+sublen,p+1,postfixlen);
-    keyname.buf[prefixlen+sublen+postfixlen] = '\0';
-    keyname.len = prefixlen+sublen+postfixlen;
-    decrRefCount(subst);
+    postfixlen = sdslen(spat)-(prefixlen+1)-(fieldlen ? fieldlen+2 : 0);
+    keyobj = createStringObject(NULL,prefixlen+sublen+postfixlen);
+    k = keyobj->ptr;
+    memcpy(k,spat,prefixlen);
+    memcpy(k+prefixlen,ssub,sublen);
+    memcpy(k+prefixlen+sublen,p+1,postfixlen);
+    decrRefCount(subst); /* Incremented by decodeObject() */
 
     /* Lookup substituted key */
-    initStaticStringObject(keyobj,((char*)&keyname)+(sizeof(struct sdshdr)));
-    o = lookupKeyRead(db,&keyobj);
-    if (o == NULL) return NULL;
+    o = lookupKeyRead(db,keyobj);
+    if (o == NULL) goto noobj;
 
-    if (fieldlen > 0) {
-        if (o->type != REDIS_HASH || fieldname.len < 1) return NULL;
+    if (fieldobj) {
+        if (o->type != REDIS_HASH) goto noobj;
 
         /* Retrieve value from hash by the field name. This operation
          * already increases the refcount of the returned object. */
-        initStaticStringObject(fieldobj,((char*)&fieldname)+(sizeof(struct sdshdr)));
-        o = hashTypeGetObject(o, &fieldobj);
+        o = hashTypeGetObject(o, fieldobj);
     } else {
-        if (o->type != REDIS_STRING) return NULL;
+        if (o->type != REDIS_STRING) goto noobj;
 
         /* Every object that this function returns needs to have its refcount
          * increased. sortCommand decreases it again. */
         incrRefCount(o);
     }
-
+    decrRefCount(keyobj);
+    if (fieldobj) decrRefCount(fieldobj);
     return o;
+
+noobj:
+    decrRefCount(keyobj);
+    if (fieldlen) decrRefCount(fieldobj);
+    return NULL;
 }
 
 /* sortCompare() is used by qsort in sortCommand(). Given that qsort_r with
@@ -102,7 +146,10 @@ int sortCompare(const void *s1, const void *s2) {
         } else if (so1->u.score < so2->u.score) {
             cmp = -1;
         } else {
-            cmp = 0;
+            /* Objects have the same score, but we don't want the comparison
+             * to be undefined, so we compare objects lexicographically.
+             * This way the result of SORT is deterministic. */
+            cmp = compareStringObjects(so1->obj,so2->obj);
         }
     } else {
         /* Alphanumeric sorting */
@@ -116,12 +163,22 @@ int sortCompare(const void *s1, const void *s2) {
                 else
                     cmp = 1;
             } else {
-                /* We have both the objects, use strcoll */
-                cmp = strcoll(so1->u.cmpobj->ptr,so2->u.cmpobj->ptr);
+                /* We have both the objects, compare them. */
+                if (server.sort_store) {
+                    cmp = compareStringObjects(so1->u.cmpobj,so2->u.cmpobj);
+                } else {
+                    /* Here we can use strcoll() directly as we are sure that
+                     * the objects are decoded string objects. */
+                    cmp = strcoll(so1->u.cmpobj->ptr,so2->u.cmpobj->ptr);
+                }
             }
         } else {
             /* Compare elements directly. */
-            cmp = compareStringObjects(so1->obj,so2->obj);
+            if (server.sort_store) {
+                cmp = compareStringObjects(so1->obj,so2->obj);
+            } else {
+                cmp = collateStringObjects(so1->obj,so2->obj);
+            }
         }
     }
     return server.sort_desc ? -cmp : cmp;
@@ -133,35 +190,37 @@ void sortCommand(redisClient *c) {
     list *operations;
     unsigned int outputlen = 0;
     int desc = 0, alpha = 0;
-    int limit_start = 0, limit_count = -1, start, end;
+    long limit_start = 0, limit_count = -1, start, end;
     int j, dontsort = 0, vectorlen;
     int getop = 0; /* GET operation counter */
+    int int_convertion_error = 0;
+    int syntax_error = 0;
     robj *sortval, *sortby = NULL, *storekey = NULL;
     redisSortObject *vector; /* Resulting vector to sort */
 
     /* Lookup the key to sort. It must be of the right types */
     sortval = lookupKeyRead(c->db,c->argv[1]);
-    if (sortval == NULL) {
-        addReply(c,shared.emptymultibulk);
-        return;
-    }
-    if (sortval->type != REDIS_SET && sortval->type != REDIS_LIST &&
-        sortval->type != REDIS_ZSET)
+    if (sortval && sortval->type != REDIS_SET &&
+                   sortval->type != REDIS_LIST &&
+                   sortval->type != REDIS_ZSET)
     {
         addReply(c,shared.wrongtypeerr);
         return;
     }
 
     /* Create a list of operations to perform for every sorted element.
-     * Operations can be GET/DEL/INCR/DECR */
+     * Operations can be GET */
     operations = listCreate();
     listSetFreeMethod(operations,zfree);
-    j = 2;
+    j = 2; /* options start at argv[2] */
 
     /* Now we need to protect sortval incrementing its count, in the future
      * SORT may have options able to overwrite/delete keys during the sorting
-     * and the sorted key itself may get destroied */
-    incrRefCount(sortval);
+     * and the sorted key itself may get destroyed */
+    if (sortval)
+        incrRefCount(sortval);
+    else
+        sortval = createQuicklistObject();
 
     /* The SORT command has an SQL-alike syntax, parse it */
     while(j < c->argc) {
@@ -173,8 +232,14 @@ void sortCommand(redisClient *c) {
         } else if (!strcasecmp(c->argv[j]->ptr,"alpha")) {
             alpha = 1;
         } else if (!strcasecmp(c->argv[j]->ptr,"limit") && leftargs >= 2) {
-            limit_start = atoi(c->argv[j+1]->ptr);
-            limit_count = atoi(c->argv[j+2]->ptr);
+            if ((getLongFromObjectOrReply(c, c->argv[j+1], &limit_start, NULL)
+                 != REDIS_OK) ||
+                (getLongFromObjectOrReply(c, c->argv[j+2], &limit_count, NULL)
+                 != REDIS_OK))
+            {
+                syntax_error++;
+                break;
+            }
             j+=2;
         } else if (!strcasecmp(c->argv[j]->ptr,"store") && leftargs >= 1) {
             storekey = c->argv[j+1];
@@ -183,33 +248,127 @@ void sortCommand(redisClient *c) {
             sortby = c->argv[j+1];
             /* If the BY pattern does not contain '*', i.e. it is constant,
              * we don't need to sort nor to lookup the weight keys. */
-            if (strchr(c->argv[j+1]->ptr,'*') == NULL) dontsort = 1;
+            if (strchr(c->argv[j+1]->ptr,'*') == NULL) {
+                dontsort = 1;
+            } else {
+                /* If BY is specified with a real patter, we can't accept
+                 * it in cluster mode. */
+                if (server.cluster_enabled) {
+                    addReplyError(c,"BY option of SORT denied in Cluster mode.");
+                    syntax_error++;
+                    break;
+                }
+            }
             j++;
         } else if (!strcasecmp(c->argv[j]->ptr,"get") && leftargs >= 1) {
+            if (server.cluster_enabled) {
+                addReplyError(c,"GET option of SORT denied in Cluster mode.");
+                syntax_error++;
+                break;
+            }
             listAddNodeTail(operations,createSortOperation(
                 REDIS_SORT_GET,c->argv[j+1]));
             getop++;
             j++;
         } else {
-            decrRefCount(sortval);
-            listRelease(operations);
             addReply(c,shared.syntaxerr);
-            return;
+            syntax_error++;
+            break;
         }
         j++;
     }
 
-    /* Load the sorting vector with all the objects to sort */
+    /* Handle syntax errors set during options parsing. */
+    if (syntax_error) {
+        decrRefCount(sortval);
+        listRelease(operations);
+        return;
+    }
+
+    /* When sorting a set with no sort specified, we must sort the output
+     * so the result is consistent across scripting and replication.
+     *
+     * The other types (list, sorted set) will retain their native order
+     * even if no sort order is requested, so they remain stable across
+     * scripting and replication. */
+    if (dontsort &&
+        sortval->type == REDIS_SET &&
+        (storekey || c->flags & REDIS_LUA_CLIENT))
+    {
+        /* Force ALPHA sorting */
+        dontsort = 0;
+        alpha = 1;
+        sortby = NULL;
+    }
+
+    /* Destructively convert encoded sorted sets for SORT. */
+    if (sortval->type == REDIS_ZSET)
+        zsetConvert(sortval, REDIS_ENCODING_SKIPLIST);
+
+    /* Objtain the length of the object to sort. */
     switch(sortval->type) {
     case REDIS_LIST: vectorlen = listTypeLength(sortval); break;
     case REDIS_SET: vectorlen =  setTypeSize(sortval); break;
     case REDIS_ZSET: vectorlen = dictSize(((zset*)sortval->ptr)->dict); break;
     default: vectorlen = 0; redisPanic("Bad SORT type"); /* Avoid GCC warning */
     }
+
+    /* Perform LIMIT start,count sanity checking. */
+    start = (limit_start < 0) ? 0 : limit_start;
+    end = (limit_count < 0) ? vectorlen-1 : start+limit_count-1;
+    if (start >= vectorlen) {
+        start = vectorlen-1;
+        end = vectorlen-2;
+    }
+    if (end >= vectorlen) end = vectorlen-1;
+
+    /* Whenever possible, we load elements into the output array in a more
+     * direct way. This is possible if:
+     *
+     * 1) The object to sort is a sorted set or a list (internally sorted).
+     * 2) There is nothing to sort as dontsort is true (BY <constant string>).
+     *
+     * In this special case, if we have a LIMIT option that actually reduces
+     * the number of elements to fetch, we also optimize to just load the
+     * range we are interested in and allocating a vector that is big enough
+     * for the selected range length. */
+    if ((sortval->type == REDIS_ZSET || sortval->type == REDIS_LIST) &&
+        dontsort &&
+        (start != 0 || end != vectorlen-1))
+    {
+        vectorlen = end-start+1;
+    }
+
+    /* Load the sorting vector with all the objects to sort */
     vector = zmalloc(sizeof(redisSortObject)*vectorlen);
     j = 0;
 
-    if (sortval->type == REDIS_LIST) {
+    if (sortval->type == REDIS_LIST && dontsort) {
+        /* Special handling for a list, if 'dontsort' is true.
+         * This makes sure we return elements in the list original
+         * ordering, accordingly to DESC / ASC options.
+         *
+         * Note that in this case we also handle LIMIT here in a direct
+         * way, just getting the required range, as an optimization. */
+        if (end >= start) {
+            listTypeIterator *li;
+            listTypeEntry entry;
+            li = listTypeInitIterator(sortval,
+                    desc ? (long)(listTypeLength(sortval) - start - 1) : start,
+                    desc ? REDIS_HEAD : REDIS_TAIL);
+
+            while(j < vectorlen && listTypeNext(li,&entry)) {
+                vector[j].obj = listTypeGet(&entry);
+                vector[j].u.score = 0;
+                vector[j].u.cmpobj = NULL;
+                j++;
+            }
+            listTypeReleaseIterator(li);
+            /* Fix start/end: output code is not aware of this optimization. */
+            end -= start;
+            start = 0;
+        }
+    } else if (sortval->type == REDIS_LIST) {
         listTypeIterator *li = listTypeInitIterator(sortval,0,REDIS_TAIL);
         listTypeEntry entry;
         while(listTypeNext(li,&entry)) {
@@ -229,13 +388,52 @@ void sortCommand(redisClient *c) {
             j++;
         }
         setTypeReleaseIterator(si);
+    } else if (sortval->type == REDIS_ZSET && dontsort) {
+        /* Special handling for a sorted set, if 'dontsort' is true.
+         * This makes sure we return elements in the sorted set original
+         * ordering, accordingly to DESC / ASC options.
+         *
+         * Note that in this case we also handle LIMIT here in a direct
+         * way, just getting the required range, as an optimization. */
+
+        zset *zs = sortval->ptr;
+        zskiplist *zsl = zs->zsl;
+        zskiplistNode *ln;
+        robj *ele;
+        int rangelen = vectorlen;
+
+        /* Check if starting point is trivial, before doing log(N) lookup. */
+        if (desc) {
+            long zsetlen = dictSize(((zset*)sortval->ptr)->dict);
+
+            ln = zsl->tail;
+            if (start > 0)
+                ln = zslGetElementByRank(zsl,zsetlen-start);
+        } else {
+            ln = zsl->header->level[0].forward;
+            if (start > 0)
+                ln = zslGetElementByRank(zsl,start+1);
+        }
+
+        while(rangelen--) {
+            redisAssertWithInfo(c,sortval,ln != NULL);
+            ele = ln->obj;
+            vector[j].obj = ele;
+            vector[j].u.score = 0;
+            vector[j].u.cmpobj = NULL;
+            j++;
+            ln = desc ? ln->backward : ln->level[0].forward;
+        }
+        /* Fix start/end: output code is not aware of this optimization. */
+        end -= start;
+        start = 0;
     } else if (sortval->type == REDIS_ZSET) {
         dict *set = ((zset*)sortval->ptr)->dict;
         dictIterator *di;
         dictEntry *setele;
         di = dictGetIterator(set);
         while((setele = dictNext(di)) != NULL) {
-            vector[j].obj = dictGetEntryKey(setele);
+            vector[j].obj = dictGetKey(setele);
             vector[j].u.score = 0;
             vector[j].u.cmpobj = NULL;
             j++;
@@ -244,7 +442,7 @@ void sortCommand(redisClient *c) {
     } else {
         redisPanic("Unknown type");
     }
-    redisAssert(j == vectorlen);
+    redisAssertWithInfo(c,sortval,j == vectorlen);
 
     /* Now it's time to load the right scores in the sorting vector */
     if (dontsort == 0) {
@@ -262,15 +460,22 @@ void sortCommand(redisClient *c) {
             if (alpha) {
                 if (sortby) vector[j].u.cmpobj = getDecodedObject(byval);
             } else {
-                if (byval->encoding == REDIS_ENCODING_RAW) {
-                    vector[j].u.score = strtod(byval->ptr,NULL);
+                if (sdsEncodedObject(byval)) {
+                    char *eptr;
+
+                    vector[j].u.score = strtod(byval->ptr,&eptr);
+                    if (eptr[0] != '\0' || errno == ERANGE ||
+                        isnan(vector[j].u.score))
+                    {
+                        int_convertion_error = 1;
+                    }
                 } else if (byval->encoding == REDIS_ENCODING_INT) {
                     /* Don't need to decode the object if it's
                      * integer-encoded (the only encoding supported) so
                      * far. We can just cast it */
                     vector[j].u.score = (long)byval->ptr;
                 } else {
-                    redisAssert(1 != 1);
+                    redisAssertWithInfo(c,sortval,1 != 1);
                 }
             }
 
@@ -282,20 +487,11 @@ void sortCommand(redisClient *c) {
         }
     }
 
-    /* We are ready to sort the vector... perform a bit of sanity check
-     * on the LIMIT option too. We'll use a partial version of quicksort. */
-    start = (limit_start < 0) ? 0 : limit_start;
-    end = (limit_count < 0) ? vectorlen-1 : start+limit_count-1;
-    if (start >= vectorlen) {
-        start = vectorlen-1;
-        end = vectorlen-2;
-    }
-    if (end >= vectorlen) end = vectorlen-1;
-
     if (dontsort == 0) {
         server.sort_desc = desc;
         server.sort_alpha = alpha;
         server.sort_bypattern = sortby ? 1 : 0;
+        server.sort_store = storekey ? 1 : 0;
         if (sortby && (start != 0 || end != vectorlen-1))
             pqsort(vector,vectorlen,sizeof(redisSortObject),sortCompare, start,end);
         else
@@ -305,7 +501,9 @@ void sortCommand(redisClient *c) {
     /* Send command output to the output buffer, performing the specified
      * GET/DEL/INCR/DECR operations if any. */
     outputlen = getop ? getop*(end-start+1) : end-start+1;
-    if (storekey == NULL) {
+    if (int_convertion_error) {
+        addReplyError(c,"One or more scores can't be converted into double");
+    } else if (storekey == NULL) {
         /* STORE option not specified, sent the sorting result to client */
         addReplyMultiBulkLen(c,outputlen);
         for (j = start; j <= end; j++) {
@@ -327,12 +525,13 @@ void sortCommand(redisClient *c) {
                         decrRefCount(val);
                     }
                 } else {
-                    redisAssert(sop->type == REDIS_SORT_GET); /* always fails */
+                    /* Always fails */
+                    redisAssertWithInfo(c,sortval,sop->type == REDIS_SORT_GET);
                 }
             }
         }
     } else {
-        robj *sobj = createZiplistObject();
+        robj *sobj = createQuicklistObject();
 
         /* STORE option specified, set the sorting result as a List object */
         for (j = start; j <= end; j++) {
@@ -357,18 +556,23 @@ void sortCommand(redisClient *c) {
                         listTypePush(sobj,val,REDIS_TAIL);
                         decrRefCount(val);
                     } else {
-                        /* always fails */
-                        redisAssert(sop->type == REDIS_SORT_GET);
+                        /* Always fails */
+                        redisAssertWithInfo(c,sortval,sop->type == REDIS_SORT_GET);
                     }
                 }
             }
         }
-        dbReplace(c->db,storekey,sobj);
-        /* Note: we add 1 because the DB is dirty anyway since even if the
-         * SORT result is empty a new key is set and maybe the old content
-         * replaced. */
-        server.dirty += 1+outputlen;
-        signalModifiedKey(c->db,storekey);
+        if (outputlen) {
+            setKey(c->db,storekey,sobj);
+            notifyKeyspaceEvent(REDIS_NOTIFY_LIST,"sortstore",storekey,
+                                c->db->id);
+            server.dirty += outputlen;
+        } else if (dbDelete(c->db,storekey)) {
+            signalModifiedKey(c->db,storekey);
+            notifyKeyspaceEvent(REDIS_NOTIFY_GENERIC,"del",storekey,c->db->id);
+            server.dirty++;
+        }
+        decrRefCount(sobj);
         addReplyLongLong(c,outputlen);
     }
 
@@ -384,5 +588,3 @@ void sortCommand(redisClient *c) {
     }
     zfree(vector);
 }
-
-

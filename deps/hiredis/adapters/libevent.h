@@ -1,4 +1,35 @@
-#include <sys/types.h>
+/*
+ * Copyright (c) 2010-2011, Pieter Noordhuis <pcnoordhuis at gmail dot com>
+ *
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright notice,
+ *     this list of conditions and the following disclaimer.
+ *   * Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in the
+ *     documentation and/or other materials provided with the distribution.
+ *   * Neither the name of Redis nor the names of its contributors may be used
+ *     to endorse or promote products derived from this software without
+ *     specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#ifndef __HIREDIS_LIBEVENT_H__
+#define __HIREDIS_LIBEVENT_H__
 #include <event.h>
 #include "../hiredis.h"
 #include "../async.h"
@@ -8,51 +39,51 @@ typedef struct redisLibeventEvents {
     struct event rev, wev;
 } redisLibeventEvents;
 
-void redisLibeventReadEvent(int fd, short event, void *arg) {
+static void redisLibeventReadEvent(int fd, short event, void *arg) {
     ((void)fd); ((void)event);
     redisLibeventEvents *e = (redisLibeventEvents*)arg;
     redisAsyncHandleRead(e->context);
 }
 
-void redisLibeventWriteEvent(int fd, short event, void *arg) {
+static void redisLibeventWriteEvent(int fd, short event, void *arg) {
     ((void)fd); ((void)event);
     redisLibeventEvents *e = (redisLibeventEvents*)arg;
     redisAsyncHandleWrite(e->context);
 }
 
-void redisLibeventAddRead(void *privdata) {
+static void redisLibeventAddRead(void *privdata) {
     redisLibeventEvents *e = (redisLibeventEvents*)privdata;
     event_add(&e->rev,NULL);
 }
 
-void redisLibeventDelRead(void *privdata) {
+static void redisLibeventDelRead(void *privdata) {
     redisLibeventEvents *e = (redisLibeventEvents*)privdata;
     event_del(&e->rev);
 }
 
-void redisLibeventAddWrite(void *privdata) {
+static void redisLibeventAddWrite(void *privdata) {
     redisLibeventEvents *e = (redisLibeventEvents*)privdata;
     event_add(&e->wev,NULL);
 }
 
-void redisLibeventDelWrite(void *privdata) {
+static void redisLibeventDelWrite(void *privdata) {
     redisLibeventEvents *e = (redisLibeventEvents*)privdata;
     event_del(&e->wev);
 }
 
-void redisLibeventCleanup(void *privdata) {
+static void redisLibeventCleanup(void *privdata) {
     redisLibeventEvents *e = (redisLibeventEvents*)privdata;
     event_del(&e->rev);
     event_del(&e->wev);
     free(e);
 }
 
-int redisLibeventAttach(redisAsyncContext *ac, struct event_base *base) {
+static int redisLibeventAttach(redisAsyncContext *ac, struct event_base *base) {
     redisContext *c = &(ac->c);
     redisLibeventEvents *e;
 
     /* Nothing should be attached when something is already attached */
-    if (ac->_adapter_data != NULL)
+    if (ac->ev.data != NULL)
         return REDIS_ERR;
 
     /* Create container for context and r/w events */
@@ -60,12 +91,12 @@ int redisLibeventAttach(redisAsyncContext *ac, struct event_base *base) {
     e->context = ac;
 
     /* Register functions to start/stop listening for events */
-    ac->evAddRead = redisLibeventAddRead;
-    ac->evDelRead = redisLibeventDelRead;
-    ac->evAddWrite = redisLibeventAddWrite;
-    ac->evDelWrite = redisLibeventDelWrite;
-    ac->evCleanup = redisLibeventCleanup;
-    ac->_adapter_data = e;
+    ac->ev.addRead = redisLibeventAddRead;
+    ac->ev.delRead = redisLibeventDelRead;
+    ac->ev.addWrite = redisLibeventAddWrite;
+    ac->ev.delWrite = redisLibeventDelWrite;
+    ac->ev.cleanup = redisLibeventCleanup;
+    ac->ev.data = e;
 
     /* Initialize and install read/write events */
     event_set(&e->rev,c->fd,EV_READ,redisLibeventReadEvent,e);
@@ -74,3 +105,4 @@ int redisLibeventAttach(redisAsyncContext *ac, struct event_base *base) {
     event_base_set(base,&e->wev);
     return REDIS_OK;
 }
+#endif

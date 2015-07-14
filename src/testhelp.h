@@ -6,7 +6,9 @@
  * test_cond("Check if 5 > 10", 5 > 10)
  * test_report()
  *
- * Copyright (c) 2010, Salvatore Sanfilippo <antirez at gmail dot com>
+ * ----------------------------------------------------------------------------
+ *
+ * Copyright (c) 2010-2012, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -48,6 +50,7 @@ int __test_num = 0;
                     __test_num-__failed_tests, __failed_tests); \
     if (__failed_tests) { \
         printf("=== WARNING === We have failed tests here...\n"); \
+        exit(1); \
     } \
 } while(0);
 

@@ -1,6 +1,6 @@
 /* adlist.h - A generic doubly linked list implementation
  *
- * Copyright (c) 2006-2010, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2006-2012, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -50,7 +50,7 @@ typedef struct list {
     void *(*dup)(void *ptr);
     void (*free)(void *ptr);
     int (*match)(void *ptr, void *key);
-    unsigned int len;
+    unsigned long len;
 } list;
 
 /* Functions implemented as macros */
@@ -81,9 +81,10 @@ listNode *listNext(listIter *iter);
 void listReleaseIterator(listIter *iter);
 list *listDup(list *orig);
 listNode *listSearchKey(list *list, void *key);
-listNode *listIndex(list *list, int index);
+listNode *listIndex(list *list, long index);
 void listRewind(list *list, listIter *li);
 void listRewindTail(list *list, listIter *li);
+void listRotate(list *list);
 
 /* Directions for iterators */
 #define AL_START_HEAD 0

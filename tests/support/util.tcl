@@ -30,12 +30,16 @@ proc zlistAlikeSort {a b} {
 proc warnings_from_file {filename} {
     set lines [split [exec cat $filename] "\n"]
     set matched 0
+    set logall 0
     set result {}
     foreach line $lines {
+        if {[string match {*REDIS BUG REPORT START*} $line]} {
+            set logall 1
+        }
         if {[regexp {^\[\d+\]\s+\d+\s+\w+\s+\d{2}:\d{2}:\d{2} \#} $line]} {
             set matched 1
         }
-        if {$matched} {
+        if {$logall || $matched} {
             lappend result $line
         }
     }
@@ -51,7 +55,7 @@ proc status {r property} {
 
 proc waitForBgsave r {
     while 1 {
-        if {[status r bgsave_in_progress] eq 1} {
+        if {[status r rdb_bgsave_in_progress] eq 1} {
             if {$::verbose} {
                 puts -nonewline "\nWaiting for background save to finish... "
                 flush stdout
@@ -65,7 +69,7 @@ proc waitForBgsave r {
 
 proc waitForBgrewriteaof r {
     while 1 {
-        if {[status r bgrewriteaof_in_progress] eq 1} {
+        if {[status r aof_rewrite_in_progress] eq 1} {
             if {$::verbose} {
                 puts -nonewline "\nWaiting for background AOF rewrite to finish... "
                 flush stdout
@@ -79,7 +83,7 @@ proc waitForBgrewriteaof r {
 
 proc wait_for_sync r {
     while 1 {
-        if {[status r master_link_status] eq "down"} {
+        if {[status $r master_link_status] eq "down"} {
             after 10
         } else {
             break
@@ -87,8 +91,18 @@ proc wait_for_sync r {
     }
 }
 
+# Random integer between 0 and max (excluded).
 proc randomInt {max} {
     expr {int(rand()*$max)}
+}
+
+# Random signed integer between -max and max (both extremes excluded).
+proc randomSignedInt {max} {
+    set i [randomInt $max]
+    if {rand() > 0.5} {
+        set i -$i
+    }
+    return $i
 }
 
 proc randpath args {
@@ -99,13 +113,13 @@ proc randpath args {
 proc randomValue {} {
     randpath {
         # Small enough to likely collide
-        randomInt 1000
+        randomSignedInt 1000
     } {
         # 32 bit compressible signed/unsigned
-        randpath {randomInt 2000000000} {randomInt 4000000000}
+        randpath {randomSignedInt 2000000000} {randomSignedInt 4000000000}
     } {
         # 64 bit
-        randpath {randomInt 1000000000000}
+        randpath {randomSignedInt 1000000000000}
     } {
         # Random string
         randpath {randstring 0 256 alpha} \
@@ -293,4 +307,67 @@ proc csvdump r {
 
 proc csvstring s {
     return "\"$s\""
+}
+
+proc roundFloat f {
+    format "%.10g" $f
+}
+
+proc find_available_port start {
+    for {set j $start} {$j < $start+1024} {incr j} {
+        if {[catch {set fd1 [socket 127.0.0.1 $j]}] &&
+            [catch {set fd2 [socket 127.0.0.1 [expr $j+10000]]}]} {
+            return $j
+        } else {
+            catch {
+                close $fd1
+                close $fd2
+            }
+        }
+    }
+    if {$j == $start+1024} {
+        error "Can't find a non busy port in the $start-[expr {$start+1023}] range."
+    }
+}
+
+# Test if TERM looks like to support colors
+proc color_term {} {
+    expr {[info exists ::env(TERM)] && [string match *xterm* $::env(TERM)]}
+}
+
+proc colorstr {color str} {
+    if {[color_term]} {
+        set b 0
+        if {[string range $color 0 4] eq {bold-}} {
+            set b 1
+            set color [string range $color 5 end]
+        }
+        switch $color {
+            red {set colorcode {31}}
+            green {set colorcode {32}}
+            yellow {set colorcode {33}}
+            blue {set colorcode {34}}
+            magenta {set colorcode {35}}
+            cyan {set colorcode {36}}
+            white {set colorcode {37}}
+            default {set colorcode {37}}
+        }
+        if {$colorcode ne {}} {
+            return "\033\[$b;${colorcode};49m$str\033\[0m"
+        }
+    } else {
+        return $str
+    }
+}
+
+# Execute a background process writing random data for the specified number
+# of seconds to the specified Redis instance.
+proc start_write_load {host port seconds} {
+    set tclsh [info nameofexecutable]
+    exec $tclsh tests/helpers/gen_write_load.tcl $host $port $seconds &
+}
+
+# Stop a process generating write load executed with start_write_load.
+proc stop_write_load {handle} {
+    catch {exec /bin/kill -9 $handle}
 }
